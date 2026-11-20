@@ -1,0 +1,120 @@
+name: Сборка Android (APK)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'branding/**'
+      - 'config.env'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - name: Проверка секретов
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::error::Нет секретов KEYSTORE_B64 / KEYSTORE_PASSWORD. Сначала запустите «Создать ключ подписи»."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          path: tgi
+
+      - name: Настройки из config.env
+        run: grep -E '^[A-Z_]+=' tgi/config.env >> "$GITHUB_ENV"
+
+      - name: Освобождаем место на диске
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost \
+            /opt/hostedtoolcache/CodeQL /usr/local/lib/node_modules || true
+          df -h /
+
+      - name: Исходники teamgram-android
+        run: |
+          git init -q src
+          cd src
+          git remote add origin https://github.com/teamgram/teamgram-android.git
+          git fetch -q --depth 1 origin "$UPSTREAM_COMMIT"
+          git checkout -q FETCH_HEAD
+          git log -1 --format='%H %s'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK, NDK, CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null
+          "$SDKM" --install "platforms;android-35" "build-tools;35.0.0" "build-tools;30.0.3" \
+            "ndk;21.4.7075529" "cmake;3.10.2.4988404" > /dev/null
+          cp "$ANDROID_HOME/build-tools/30.0.3/dx" "$ANDROID_HOME/build-tools/35.0.0/dx"
+          cp "$ANDROID_HOME/build-tools/30.0.3/lib/dx.jar" "$ANDROID_HOME/build-tools/35.0.0/lib/dx.jar"
+          echo "sdk.dir=$ANDROID_HOME" > src/local.properties
+
+      - name: Ребрендинг (название, пакет, сервер, иконка)
+        env:
+          ICON_PREVIEW: ${{ github.workspace }}/icon-preview.png
+        run: |
+          python3 -m pip install --quiet pillow
+          bash tgi/branding/rebrand.sh src
+
+      - name: Ключ подписи
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: echo "$KEYSTORE_B64" | base64 -d > src/TMessagesProj/config/release.keystore
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Сборка APK
+        working-directory: src
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          gradle :TMessagesProj_App:assembleAfatRelease --no-daemon --stacktrace \
+            -PRELEASE_STORE_PASSWORD="$KEYSTORE_PASSWORD" \
+            -PRELEASE_KEY_PASSWORD="$KEYSTORE_PASSWORD" \
+            -PRELEASE_KEY_ALIAS=telegrami
+
+      - name: Готовый файл
+        run: |
+          APK=$(find src/TMessagesProj_App/build/outputs/apk -name '*.apk' | head -n 1)
+          [ -n "$APK" ] || { echo "::error::APK не найден"; exit 1; }
+          mkdir -p out
+          cp "$APK" "out/telegram-i-${GITHUB_RUN_NUMBER}.apk"
+          cp icon-preview.png out/ || true
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: telegram-i-apk
+          path: out/
+          retention-days: 30
+
+      - name: Релиз с APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${GITHUB_RUN_NUMBER}" out/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "telegram i, сборка ${GITHUB_RUN_NUMBER}" \
+            --notes "Сервер: ${SERVER_IP:-тестовый сервер Teamgram (43.155.11.190)}. Пакет: ${APP_PACKAGE}."
